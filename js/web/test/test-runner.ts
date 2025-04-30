@@ -116,7 +116,7 @@ async function loadTensors(
   const outputs: Test.NamedTensor[] = [];
   let dataFileType: 'none' | 'pb' | 'npy' = 'none';
 
-  const allowInt64 = ['wasm', 'webgpu', 'webnn'].includes(backendName);
+  const allowInt64 = ['wasm', 'xnnpack', 'webgpu', 'webnn'].includes(backendName);
 
   for (const dataFile of testCase.dataFiles) {
     const ext = extname(dataFile);
@@ -378,7 +378,7 @@ export class TensorResultValidator {
     } else if (backend === 'webgpu') {
       this.absoluteThreshold = WEBGPU_THRESHOLD_ABSOLUTE_ERROR;
       this.relativeThreshold = WEBGPU_THRESHOLD_RELATIVE_ERROR;
-    } else if (backend === 'wasm' || backend === 'webnn') {
+    } else if (backend === 'wasm' || backend === 'xnnpack' || backend === 'webnn') {
       this.absoluteThreshold = WASM_THRESHOLD_ABSOLUTE_ERROR;
       this.relativeThreshold = WASM_THRESHOLD_RELATIVE_ERROR;
     } else if (backend === 'onnxruntime') {

@@ -38,6 +38,7 @@ Options:
                                    webgl
                                    webgpu
                                    wasm
+                                   xnnpack
                                    webnn
  -e=<...>, --env=<...>         Specify the environment to run the test. Should be one of the following:
                                  chrome     (default)
@@ -133,7 +134,7 @@ Examples:
 
 export declare namespace TestRunnerCliArgs {
   type Mode = 'suite0' | 'suite1' | 'model' | 'unittest' | 'op';
-  type Backend = 'cpu' | 'webgl' | 'webgpu' | 'wasm' | 'onnxruntime' | 'webnn';
+  type Backend = 'cpu' | 'webgl' | 'webgpu' | 'wasm' | 'onnxruntime' | 'xnnpack' | 'webnn';
   type Environment = 'chrome' | 'chromecanary' | 'edge' | 'firefox' | 'electron' | 'safari' | 'node' | 'bs';
   type BundleMode = 'dev' | 'perf';
   type IOBindingMode = 'none' | 'gpu-tensor' | 'gpu-location' | 'ml-tensor' | 'ml-location';
@@ -398,13 +399,13 @@ export function parseTestRunnerCliArgs(cmdlineArgs: string[]): TestRunnerCliArgs
   }
 
   // Option: -b=<...>, --backend=<...>
-  const browserBackends = ['webgl', 'webgpu', 'wasm', 'webnn'];
+  const browserBackends = ['webgl', 'webgpu', 'wasm', 'xnnpack', 'webnn'];
 
   // TODO: remove this when Chrome support WebNN.
   //       we need this for now because Chrome does not support webnn yet,
   //       and ChromeCanary is not in CI.
 
-  const defaultBrowserBackends = ['webgl', 'webgpu', 'wasm' /*, 'webnn'*/];
+  const defaultBrowserBackends = ['webgl', 'webgpu', 'wasm', 'xnnpack' /*, 'webnn'*/];
   const nodejsBackends = ['cpu', 'wasm', 'webgpu'];
   const backendArgs = args.backend || args.b;
   const backend =
