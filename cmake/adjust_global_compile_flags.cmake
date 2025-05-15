@@ -34,6 +34,8 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
   else()
     set(CMAKE_CXX_FLAGS_DEBUG "-g2")
   endif()
+  # set(CMAKE_CXX_FLAGS "-g2")
+  # set(CMAKE_C_FLAGS "-g2")
 
   if (onnxruntime_ENABLE_WEBASSEMBLY_RELAXED_SIMD)
     string(APPEND CMAKE_C_FLAGS " -msimd128 -mrelaxed-simd")
