@@ -32,19 +32,46 @@ class LstmStateCopyProgram final : public Program<LstmStateCopyProgram> {
   bool has_seq_lens_;
 };
 
+// Precomputes the input-to-gate projection for the whole sequence in a single
+// massively-parallel dispatch: proj[dir, t, b, r] = sum_k X[t,b,k] * W[dir,r,k] + bias[dir,r]
+// for r in [0, 4H) (gate-major rows i,o,f,c). The full bias (input bias Wb + recurrence
+// bias Rb) is folded in here because it depends on neither the timestep nor the recurrence.
+// This removes the inner input_size loop and the x/w/b bindings from the serial per-timestep
+// cell, and runs the dominant matmul once off the recurrent critical path.
+// Output layout: ((dir * seq_length + t) * batch + b) * (4H) + r
+class LstmGateProjectionProgram final : public Program<LstmGateProjectionProgram> {
+ public:
+  LstmGateProjectionProgram(bool has_bias, int layout, int components)
+      : Program{"LstmGateProjection"}, has_bias_(has_bias), layout_(layout), components_(components) {}
+  Status GenerateShaderCode(ShaderHelper& shader) const override;
+  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
+      {"batch_size", ProgramUniformVariableDataType::Uint32},
+      {"input_size", ProgramUniformVariableDataType::Uint32},
+      {"hidden_size", ProgramUniformVariableDataType::Uint32},
+      {"seq_length", ProgramUniformVariableDataType::Uint32},
+      {"num_directions", ProgramUniformVariableDataType::Uint32});
+
+ private:
+  bool has_bias_;
+  int layout_;
+  int components_;  // 1 (scalar) or 4 (vec4) for the input-size reduction dimension
+};
+
 // Per-timestep LSTM cell compute.
 // All h_prev/c_prev use flat [batch, H] indexing (initial state is pre-loaded into temp buffers).
-// Inputs: x, w, r, h_prev, c_prev, [b], [p]
+// The input-to-gate projection (X*W^T + bias) is precomputed by LstmGateProjectionProgram and
+// passed in as `proj`; the cell only performs the recurrent H_prev*R^T, peephole, clip,
+// activations and cell-state update.
+// Inputs: proj, r, h_prev, c_prev, [p]
 // Outputs: h_new, c_new, [y_out]
 class LstmCellProgram final : public Program<LstmCellProgram> {
  public:
-  LstmCellProgram(bool has_bias, bool has_peephole, bool has_Y, bool has_seq_lens,
+  LstmCellProgram(bool has_peephole, bool has_Y, bool has_seq_lens,
                   bool input_forget, bool has_clip, int layout,
                   const std::string& f_activation_fn,
                   const std::string& g_activation_fn,
                   const std::string& h_activation_fn)
       : Program{"LstmCell"},
-        has_bias_(has_bias),
         has_peephole_(has_peephole),
         has_Y_(has_Y),
         has_seq_lens_(has_seq_lens),
@@ -59,7 +86,6 @@ class LstmCellProgram final : public Program<LstmCellProgram> {
 
   WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
       {"batch_size", ProgramUniformVariableDataType::Uint32},
-      {"input_size", ProgramUniformVariableDataType::Uint32},
       {"hidden_size", ProgramUniformVariableDataType::Uint32},
       {"direction", ProgramUniformVariableDataType::Uint32},
       {"num_directions", ProgramUniformVariableDataType::Uint32},
@@ -68,7 +94,6 @@ class LstmCellProgram final : public Program<LstmCellProgram> {
       {"clip_value", ProgramUniformVariableDataType::Float32});
 
  private:
-  bool has_bias_;
   bool has_peephole_;
   bool has_Y_;
   bool has_seq_lens_;

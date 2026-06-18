@@ -94,15 +94,79 @@ Status LstmStateCopyProgram::GenerateShaderCode(ShaderHelper& shader) const {
 }
 
 // ===========================================================================
-// LstmCellProgram - one cell step, always flat [batch, H] for h_prev/c_prev
+// LstmGateProjectionProgram - precompute X*W^T + bias for the whole sequence.
+// One thread per (dir, t, b, gate-row r in [0,4H)). Output index:
+//   ((dir * seq_length + t) * batch + b) * (4H) + r
 // ===========================================================================
-Status LstmCellProgram::GenerateShaderCode(ShaderHelper& shader) const {
+Status LstmGateProjectionProgram::GenerateShaderCode(ShaderHelper& shader) const {
+  // x and w are declared as vec4<f32> (components_ == 4) to coalesce the input-size
+  // reduction into 16-byte loads, or scalar f32 (components_ == 1) as a fallback.
+  const bool vec4 = (components_ == 4);
   shader.AddInput("x", ShaderUsage::UseElementTypeAlias);
   shader.AddInput("w", ShaderUsage::UseElementTypeAlias);
+  if (has_bias_) shader.AddInput("b", ShaderUsage::UseElementTypeAlias);
+  shader.AddOutput("proj", ShaderUsage::UseElementTypeAlias);
+
+  auto& body = shader.MainFunctionBody();
+  body << "  let H = uniforms.hidden_size;\n"
+       << "  let I = uniforms.input_size;\n"
+       << "  let B = uniforms.batch_size;\n"
+       << "  let S = uniforms.seq_length;\n"
+       << "  let num_dir = uniforms.num_directions;\n"
+       << "  let G = 4u * H;\n"
+       << "  let total = num_dir * S * B * G;\n"
+       << "  if (global_idx >= total) { return; }\n"
+       // Decompose global_idx into (dir, t, batch_idx, row r in [0,4H))
+       << "  let r = global_idx % G;\n"
+       << "  let tmp0 = global_idx / G;\n"
+       << "  let batch_idx = tmp0 % B;\n"
+       << "  let tmp1 = tmp0 / B;\n"
+       << "  let t = tmp1 % S;\n"
+       << "  let dir = tmp1 / S;\n\n";
+
+  // X row base for (t, batch_idx) honoring layout (in element units).
+  if (layout_ == 0) {
+    body << "  let x_base = (t * B + batch_idx) * I;\n";
+  } else {
+    body << "  let x_base = (batch_idx * S + t) * I;\n";
+  }
+  // W row base: gate-row r within direction's 4H x I block (in element units).
+  body << "  let w_base = dir * G * I + r * I;\n"
+       << "  var acc: f32 = 0.0;\n";
+
+  if (vec4) {
+    // x_base and w_base are multiples of I, and I % 4 == 0, so both are vec4-aligned.
+    body << "  let xb4 = x_base / 4u;\n"
+         << "  let wb4 = w_base / 4u;\n"
+         << "  let I4 = I / 4u;\n"
+         << "  for (var k: u32 = 0u; k < I4; k++) {\n"
+         << "    acc += dot(x[xb4 + k], w[wb4 + k]);\n"
+         << "  }\n";
+  } else {
+    body << "  for (var k: u32 = 0u; k < I; k++) {\n"
+         << "    acc += f32(x[x_base + k]) * f32(w[w_base + k]);\n"
+         << "  }\n";
+  }
+
+  // Fold in full bias = input bias Wb (rows [0,4H)) + recurrence bias Rb (rows [4H,8H)).
+  if (has_bias_) {
+    body << "  let bb = dir * 8u * H;\n"
+         << "  acc += f32(b[bb + r]) + f32(b[bb + G + r]);\n";
+  }
+  body << "  proj[global_idx] = proj_element_t(acc);\n";
+  return Status::OK();
+}
+
+// ===========================================================================
+// LstmCellProgram - one cell step, always flat [batch, H] for h_prev/c_prev.
+// The X*W^T+bias projection is precomputed (input `proj`); this only does the
+// recurrent H_prev*R^T plus gate math.
+// ===========================================================================
+Status LstmCellProgram::GenerateShaderCode(ShaderHelper& shader) const {
+  shader.AddInput("proj", ShaderUsage::UseElementTypeAlias);
   shader.AddInput("r", ShaderUsage::UseElementTypeAlias);
   shader.AddInput("h_prev", ShaderUsage::UseElementTypeAlias);
   shader.AddInput("c_prev", ShaderUsage::UseElementTypeAlias);
-  if (has_bias_) shader.AddInput("b", ShaderUsage::UseElementTypeAlias);
   if (has_peephole_) shader.AddInput("p", ShaderUsage::UseElementTypeAlias);
   if (has_seq_lens_) shader.AddInput("seq_lens", ShaderUsage::UseElementTypeAlias);
 
@@ -124,7 +188,6 @@ Status LstmCellProgram::GenerateShaderCode(ShaderHelper& shader) const {
   auto& body = shader.MainFunctionBody();
 
   body << "  let H = uniforms.hidden_size;\n"
-       << "  let I = uniforms.input_size;\n"
        << "  let B = uniforms.batch_size;\n"
        << "  let dir = uniforms.direction;\n"
        << "  let num_dir = uniforms.num_directions;\n"
@@ -152,26 +215,14 @@ Status LstmCellProgram::GenerateShaderCode(ShaderHelper& shader) const {
          << "  }\n\n";
   }
 
-  // Gate accumulators (ONNX gate order: i, o, f, c)
-  body << "  var gate_i: f32 = 0.0;\n"
-       << "  var gate_o: f32 = 0.0;\n"
-       << "  var gate_f: f32 = 0.0;\n"
-       << "  var gate_c: f32 = 0.0;\n\n";
-
-  // X * W^T
-  body << "  let w_base = dir * 4u * H * I;\n";
-  if (layout_ == 0) {
-    body << "  let x_base = (uniforms.timestep * B + batch_idx) * I;\n";
-  } else {
-    body << "  let x_base = (batch_idx * uniforms.seq_length + uniforms.timestep) * I;\n";
-  }
-  body << "  for (var k: u32 = 0u; k < I; k++) {\n"
-       << "    let xv = f32(x[x_base + k]);\n"
-       << "    gate_i += xv * f32(w[w_base + j * I + k]);\n"
-       << "    gate_o += xv * f32(w[w_base + (H + j) * I + k]);\n"
-       << "    gate_f += xv * f32(w[w_base + (2u * H + j) * I + k]);\n"
-       << "    gate_c += xv * f32(w[w_base + (3u * H + j) * I + k]);\n"
-       << "  }\n\n";
+  // Gate accumulators (ONNX gate order: i, o, f, c) seeded with the precomputed
+  // input projection proj[((dir * S + t) * B + batch_idx) * 4H + row].
+  body << "  let G = 4u * H;\n"
+       << "  let proj_base = ((dir * uniforms.seq_length + uniforms.timestep) * B + batch_idx) * G;\n"
+       << "  var gate_i: f32 = f32(proj[proj_base + j]);\n"
+       << "  var gate_o: f32 = f32(proj[proj_base + H + j]);\n"
+       << "  var gate_f: f32 = f32(proj[proj_base + 2u * H + j]);\n"
+       << "  var gate_c: f32 = f32(proj[proj_base + 3u * H + j]);\n\n";
 
   // H_prev * R^T  (h_prev always [batch, H] - flat indexing)
   body << "  let r_base = dir * 4u * H * H;\n"
@@ -183,15 +234,6 @@ Status LstmCellProgram::GenerateShaderCode(ShaderHelper& shader) const {
        << "    gate_f += hv * f32(r[r_base + (2u * H + j) * H + k]);\n"
        << "    gate_c += hv * f32(r[r_base + (3u * H + j) * H + k]);\n"
        << "  }\n\n";
-
-  // Bias
-  if (has_bias_) {
-    body << "  let bb = dir * 8u * H;\n"
-         << "  gate_i += f32(b[bb + j]) + f32(b[bb + 4u * H + j]);\n"
-         << "  gate_o += f32(b[bb + H + j]) + f32(b[bb + 5u * H + j]);\n"
-         << "  gate_f += f32(b[bb + 2u * H + j]) + f32(b[bb + 6u * H + j]);\n"
-         << "  gate_c += f32(b[bb + 3u * H + j]) + f32(b[bb + 7u * H + j]);\n\n";
-  }
 
   // c_prev (flat [batch, H])
   body << "  let c_base = batch_idx * H;\n"
@@ -393,10 +435,48 @@ Status Lstm::ComputeInternal(ComputeContext& context) const {
   };
 
   // Check if the cell program would exceed storage buffer limits (max 10).
-  // Base bindings: x, w, r, h_prev, c_prev (5 inputs) + h_new, c_new (2 outputs) = 7.
-  int cell_bindings = 7 + (B != nullptr ? 1 : 0) + (P != nullptr ? 1 : 0) + (has_seq_lens ? 1 : 0) + (has_Y ? 1 : 0);
+  // Base bindings: proj, r, h_prev, c_prev (4 inputs) + h_new, c_new (2 outputs) = 6.
+  int cell_bindings = 6 + (P != nullptr ? 1 : 0) + (has_seq_lens ? 1 : 0) + (has_Y ? 1 : 0);
   bool split_y = (cell_bindings > 10) && has_Y;
   bool cell_has_Y = has_Y && !split_y;
+
+  // Precompute the input-to-gate projection X*W^T + bias for the whole sequence and all
+  // directions in one massively-parallel dispatch. proj layout: [num_dir, seq, batch, 4H].
+  TensorShape proj_shape({static_cast<int64_t>(num_directions) * seq_length * batch_size * 4 * hidden_size_});
+  Tensor proj = context.CreateGPUTensor(dtype, proj_shape);
+  {
+    uint32_t proj_threads = static_cast<uint32_t>(num_directions) *
+                            static_cast<uint32_t>(seq_length) *
+                            static_cast<uint32_t>(batch_size) * 4u * H;
+    uint32_t proj_wg = std::min(proj_threads, 256u);
+    if (proj_wg == 0) proj_wg = 1;
+    uint32_t proj_groups = (proj_threads + proj_wg - 1) / proj_wg;
+    // Vectorize the input-size reduction when it is a multiple of 4. x/w row bases are
+    // multiples of input_size, so they stay vec4-aligned.
+    int proj_components = (input_size % 4 == 0) ? 4 : 1;
+    LstmGateProjectionProgram proj_prog{B != nullptr, static_cast<int>(layout_), proj_components};
+    proj_prog.CacheHint(std::to_string(B != nullptr), std::to_string(layout_), std::to_string(proj_components));
+    proj_prog.SetWorkgroupSize(proj_wg).SetDispatchGroupSize(proj_groups);
+    if (proj_components == 4) {
+      int64_t x_elems = seq_length * batch_size * input_size;
+      int64_t w_elems = static_cast<int64_t>(num_directions) * 4 * hidden_size_ * input_size;
+      proj_prog.AddInputs({{X, ProgramTensorMetadataDependency::Type, TensorShape({x_elems / 4}), 4}})
+          .AddInputs({{W, ProgramTensorMetadataDependency::Type, TensorShape({w_elems / 4}), 4}});
+    } else {
+      proj_prog.AddInputs({{X, ProgramTensorMetadataDependency::Type}})
+          .AddInputs({{W, ProgramTensorMetadataDependency::Type}});
+    }
+    if (B != nullptr) proj_prog.AddInputs({{B, ProgramTensorMetadataDependency::Type}});
+    proj_prog.AddOutputs({{&proj, ProgramTensorMetadataDependency::None}});
+    proj_prog.AddUniformVariables({
+        {static_cast<uint32_t>(batch_size)},
+        {static_cast<uint32_t>(input_size)},
+        {H},
+        {static_cast<uint32_t>(seq_length)},
+        {static_cast<uint32_t>(num_directions)},
+    });
+    ORT_RETURN_IF_ERROR(context.RunProgram(proj_prog));
+  }
 
   for (int dir = 0; dir < num_directions; dir++) {
     std::string fa = ActivationToWgslFn(activations_[dir * 3 + 0]);
@@ -444,23 +524,21 @@ Status Lstm::ComputeInternal(ComputeContext& context) const {
         c_write = &C_a;
       }
 
-      LstmCellProgram program{B != nullptr, P != nullptr, cell_has_Y, has_seq_lens,
+      LstmCellProgram program{P != nullptr, cell_has_Y, has_seq_lens,
                               input_forget_ != 0, clip_ > 0.0f,
                               static_cast<int>(layout_), fa, ga, ha};
 
-      program.CacheHint(std::to_string(B != nullptr), std::to_string(P != nullptr),
+      program.CacheHint(std::to_string(P != nullptr),
                         std::to_string(cell_has_Y), std::to_string(has_seq_lens),
                         std::to_string(input_forget_ != 0), std::to_string(clip_ > 0.0f),
                         std::to_string(layout_), fa, ga, ha);
 
       program.SetWorkgroupSize(wg_size).SetDispatchGroupSize(num_groups);
 
-      program.AddInputs({{X, ProgramTensorMetadataDependency::Type}})
-          .AddInputs({{W, ProgramTensorMetadataDependency::Type}})
+      program.AddInputs({{&proj, ProgramTensorMetadataDependency::Type}})
           .AddInputs({{R, ProgramTensorMetadataDependency::Type}})
           .AddInputs({{h_read, ProgramTensorMetadataDependency::Type}})
           .AddInputs({{c_read, ProgramTensorMetadataDependency::Type}});
-      if (B != nullptr) program.AddInputs({{B, ProgramTensorMetadataDependency::Type}});
       if (P != nullptr) program.AddInputs({{P, ProgramTensorMetadataDependency::Type}});
       if (has_seq_lens) program.AddInputs({{sequence_lens, ProgramTensorMetadataDependency::Type}});
 
@@ -470,7 +548,6 @@ Status Lstm::ComputeInternal(ComputeContext& context) const {
 
       program.AddUniformVariables({
           {static_cast<uint32_t>(batch_size)},
-          {static_cast<uint32_t>(input_size)},
           {H},
           {static_cast<uint32_t>(dir)},
           {static_cast<uint32_t>(num_directions)},
